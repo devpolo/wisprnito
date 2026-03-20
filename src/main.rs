@@ -1,6 +1,8 @@
 mod audio;
 mod config;
 mod dsp;
+#[cfg(target_os = "macos")]
+mod menubar;
 mod platform;
 
 use clap::{Parser, Subcommand};
@@ -39,6 +41,9 @@ enum Commands {
     Config,
     /// Remove LaunchAgent and stop the daemon
     Uninstall,
+    /// Show menu bar status icon (macOS)
+    #[cfg(target_os = "macos")]
+    Menubar,
     /// Run in foreground (used internally by `start`)
     #[command(hide = true)]
     Foreground {
@@ -97,6 +102,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Devices => cmd_devices(),
         Commands::Config => cmd_config(),
         Commands::Uninstall => cmd_uninstall(),
+        #[cfg(target_os = "macos")]
+        Commands::Menubar => menubar::run(),
         Commands::Foreground { input, output, low_latency, pitch, formant, jitter, passthrough } => {
             cmd_foreground(input, output, low_latency, pitch, formant, jitter, passthrough)
         }
@@ -387,17 +394,20 @@ fn cmd_config() -> anyhow::Result<()> {
 fn cmd_uninstall() -> anyhow::Result<()> {
     // Stop daemon if running
     cmd_stop().ok();
-    // Unload and remove LaunchAgent plist
-    let plist = {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join("Library/LaunchAgents/com.devpolo.wisprnito.plist")
-    };
-    if plist.exists() {
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", plist.to_str().unwrap()])
-            .status();
-        std::fs::remove_file(&plist)?;
-        println!("LaunchAgent removed.");
+    // Unload and remove LaunchAgent plists
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    for name in &[
+        "com.devpolo.wisprnito.menubar.plist",
+        "com.devpolo.wisprnito.plist",
+    ] {
+        let plist = PathBuf::from(&home).join("Library/LaunchAgents").join(name);
+        if plist.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", plist.to_str().unwrap()])
+                .status();
+            std::fs::remove_file(&plist)?;
+            println!("Removed {}.", name);
+        }
     }
     // Remove data dir
     let _ = std::fs::remove_dir_all(pid_file_path().parent().unwrap());

@@ -80,19 +80,21 @@ install_macos() {
 }
 
 install_launchagent() {
-    local plist=~/Library/LaunchAgents/com.devpolo.wisprnito.plist
+    local plist=~/Library/LaunchAgents/com.devpolo.wisprnito.menubar.plist
+    mkdir -p ~/Library/LaunchAgents
     cat > "$plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.devpolo.wisprnito</string>
+  <key>Label</key><string>com.devpolo.wisprnito.menubar</string>
   <key>ProgramArguments</key>
-  <array><string>/usr/local/bin/wisprnito</string><string>start</string></array>
+  <array><string>/usr/local/bin/wisprnito</string><string>menubar</string></array>
   <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
 </dict></plist>
 PLIST
     launchctl load "$plist" 2>/dev/null || true
-    info "LaunchAgent installed — wisprnito will auto-start on login."
+    info "Menu bar icon installed — will auto-start on login."
 }
 
 install_linux() {
