@@ -52,6 +52,9 @@ enum Commands {
         formant: f32,
         #[arg(long)]
         jitter: f32,
+        /// Skip DSP — copy mic directly to output for testing routing
+        #[arg(long)]
+        passthrough: bool,
     },
 }
 
@@ -91,8 +94,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Status => cmd_status(),
         Commands::Devices => cmd_devices(),
         Commands::Config => cmd_config(),
-        Commands::Foreground { input, output, low_latency, pitch, formant, jitter } => {
-            cmd_foreground(input, output, low_latency, pitch, formant, jitter)
+        Commands::Foreground { input, output, low_latency, pitch, formant, jitter, passthrough } => {
+            cmd_foreground(input, output, low_latency, pitch, formant, jitter, passthrough)
         }
     }
 }
@@ -198,6 +201,7 @@ fn cmd_foreground(
     pitch: f32,
     formant: f32,
     jitter: f32,
+    passthrough: bool,
 ) -> anyhow::Result<()> {
     let params = dsp::AnonymizationParams {
         pitch_semitones: pitch,
@@ -254,12 +258,18 @@ fn cmd_foreground(
     let sample_rate = streams.sample_rate;
     eprintln!("Sample rate: {}Hz", sample_rate);
 
-    let pipeline = dsp::Pipeline::new(params, sample_rate, fft_size)?;
-
     let dsp_running = running.clone();
-    let dsp_thread = std::thread::spawn(move || {
-        audio::routing::run_dsp_loop(input_cons, output_prod, pipeline, block_size, dsp_running);
-    });
+    let dsp_thread = if passthrough {
+        eprintln!("Mode: PASSTHROUGH (no DSP — testing routing only)");
+        std::thread::spawn(move || {
+            audio::routing::run_passthrough(input_cons, output_prod, dsp_running);
+        })
+    } else {
+        let pipeline = dsp::Pipeline::new(params, sample_rate, fft_size)?;
+        std::thread::spawn(move || {
+            audio::routing::run_dsp_loop(input_cons, output_prod, pipeline, block_size, dsp_running);
+        })
+    };
 
     eprintln!("Running. Send SIGTERM to stop.");
 

@@ -1,5 +1,6 @@
 use num_complex::Complex;
-use realfft::{RealFftPlanner, RealToComplex, ComplexToReal};
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::sync::Arc;
 
@@ -7,13 +8,21 @@ pub struct Stft {
     fft_size: usize,
     hop_size: usize,
     window: Vec<f32>,
+    /// Per-sample normalization: 1 / (fft_size * COLA_sum)
+    norm: f32,
     forward: Arc<dyn RealToComplex<f32>>,
     inverse: Arc<dyn ComplexToReal<f32>>,
-    // Pre-allocated scratch buffers
-    scratch_forward: Vec<Complex<f32>>,
-    scratch_inverse: Vec<Complex<f32>>,
+    // Analysis state: incoming samples accumulate here
+    analysis_buf: VecDeque<f32>,
+    // Synthesis state: overlap-add accumulator (length = fft_size)
+    synthesis_accum: Vec<f32>,
+    // Samples ready to be consumed by the caller
+    output_ready: VecDeque<f32>,
+    // Scratch buffers (pre-allocated, reused every frame)
     time_buf: Vec<f32>,
     freq_buf: Vec<Complex<f32>>,
+    scratch_fwd: Vec<Complex<f32>>,
+    scratch_inv: Vec<Complex<f32>>,
 }
 
 impl Stft {
@@ -22,116 +31,135 @@ impl Stft {
         let forward = planner.plan_fft_forward(fft_size);
         let inverse = planner.plan_fft_inverse(fft_size);
 
-        let scratch_forward = forward.make_scratch_vec();
-        let scratch_inverse = inverse.make_scratch_vec();
-        let time_buf = vec![0.0f32; fft_size];
+        let scratch_fwd = forward.make_scratch_vec();
+        let scratch_inv = inverse.make_scratch_vec();
         let freq_buf = forward.make_output_vec();
 
         let window = hann_window(fft_size);
+        let norm = cola_norm(&window, hop_size, fft_size);
+
+        // Pre-fill analysis buffer so the first output frame aligns with t=0.
+        // Without pre-fill, the first fft_size-hop_size input samples are silently consumed
+        // before any output arrives. Pre-filling with zeros gives the expected latency of
+        // exactly fft_size/2 samples (group delay of the windowed analysis).
+        let mut analysis_buf = VecDeque::with_capacity(fft_size * 2);
+        for _ in 0..fft_size - hop_size {
+            analysis_buf.push_back(0.0f32);
+        }
 
         Self {
             fft_size,
             hop_size,
             window,
+            norm,
             forward,
             inverse,
-            scratch_forward,
-            scratch_inverse,
-            time_buf,
+            analysis_buf,
+            synthesis_accum: vec![0.0f32; fft_size],
+            output_ready: VecDeque::new(),
+            time_buf: vec![0.0f32; fft_size],
             freq_buf,
+            scratch_fwd,
+            scratch_inv,
         }
     }
 
-    /// Analyze input signal into overlapping STFT frames.
-    /// Returns a vector of complex spectrum frames (each of length fft_size/2 + 1).
-    pub fn analyze(&mut self, input: &[f32]) -> Vec<Vec<Complex<f32>>> {
-        let mut frames = Vec::new();
-        let num_samples = input.len();
-        let mut offset = 0usize;
+    /// Feed incoming audio samples into the analysis buffer.
+    pub fn push_samples(&mut self, samples: &[f32]) {
+        self.analysis_buf.extend(samples.iter().copied());
+    }
 
-        while offset + self.fft_size <= num_samples {
-            // Apply window
-            for i in 0..self.fft_size {
-                self.time_buf[i] = input[offset + i] * self.window[i];
-            }
+    /// Returns true if enough samples are buffered to produce the next analysis frame.
+    pub fn has_analysis_frame(&self) -> bool {
+        self.analysis_buf.len() >= self.fft_size
+    }
 
-            // Forward FFT
-            self.forward
-                .process_with_scratch(&mut self.time_buf, &mut self.freq_buf, &mut self.scratch_forward)
-                .expect("forward FFT failed");
-
-            frames.push(self.freq_buf.clone());
-
-            offset += self.hop_size;
+    /// Extract the next windowed analysis frame and return its spectrum.
+    /// Advances the analysis buffer by `hop_size` samples.
+    /// Returns `None` if fewer than `fft_size` samples are available.
+    pub fn pop_analysis_frame(&mut self) -> Option<Vec<Complex<f32>>> {
+        if self.analysis_buf.len() < self.fft_size {
+            return None;
         }
 
-        frames
-    }
-
-    /// Synthesize time-domain signal from STFT frames using overlap-add.
-    pub fn synthesize(&mut self, frames: &[Vec<Complex<f32>>]) -> Vec<f32> {
-        if frames.is_empty() {
-            return Vec::new();
+        // Window and copy fft_size samples (without removing the overlap)
+        for (i, &s) in self.analysis_buf.iter().take(self.fft_size).enumerate() {
+            self.time_buf[i] = s * self.window[i];
         }
 
-        let output_len = self.fft_size + (frames.len() - 1) * self.hop_size;
-        let mut output = vec![0.0f32; output_len];
-
-        // Compute the synthesis normalization factor for the overlap-add.
-        // For Hann window with 75% overlap (hop = fft_size/4), the sum-of-squares = 1.5.
-        // General COLA normalization:
-        let window_sum = cola_normalization(&self.window, self.hop_size);
-
-        for (frame_idx, frame) in frames.iter().enumerate() {
-            let out_offset = frame_idx * self.hop_size;
-
-            // Copy spectrum into working buffer
-            self.freq_buf.copy_from_slice(frame);
-
-            // Inverse FFT
-            self.inverse
-                .process_with_scratch(&mut self.freq_buf, &mut self.time_buf, &mut self.scratch_inverse)
-                .expect("inverse FFT failed");
-
-            // Apply synthesis window and normalize, then overlap-add
-            let norm = 1.0 / (self.fft_size as f32 * window_sum);
-            for i in 0..self.fft_size {
-                output[out_offset + i] += self.time_buf[i] * self.window[i] * norm;
-            }
+        // Advance by hop_size (the overlap remains in analysis_buf)
+        for _ in 0..self.hop_size {
+            self.analysis_buf.pop_front();
         }
 
-        output
+        self.forward
+            .process_with_scratch(
+                &mut self.time_buf,
+                &mut self.freq_buf,
+                &mut self.scratch_fwd,
+            )
+            .expect("forward FFT failed");
+
+        Some(self.freq_buf.clone())
     }
 
-    pub fn fft_size(&self) -> usize {
-        self.fft_size
+    /// Accept a processed synthesis frame, overlap-add it into the accumulator,
+    /// and make `hop_size` samples available via `drain_output`.
+    pub fn push_synthesis_frame(&mut self, frame: &[Complex<f32>]) {
+        self.freq_buf.copy_from_slice(frame);
+        // DC and Nyquist bins must be real-valued for the real IFFT.
+        // Any phase modification from the vocoder/jitter must be discarded here.
+        let last = self.freq_buf.len() - 1;
+        self.freq_buf[0] = Complex::new(self.freq_buf[0].norm(), 0.0);
+        self.freq_buf[last] = Complex::new(self.freq_buf[last].norm(), 0.0);
+
+        self.inverse
+            .process_with_scratch(
+                &mut self.freq_buf,
+                &mut self.time_buf,
+                &mut self.scratch_inv,
+            )
+            .expect("inverse FFT failed");
+
+        // Overlap-add with synthesis window and normalization
+        for i in 0..self.fft_size {
+            self.synthesis_accum[i] += self.time_buf[i] * self.window[i] * self.norm;
+        }
+
+        // Drain the leading hop_size samples — they are fully accumulated
+        for i in 0..self.hop_size {
+            self.output_ready.push_back(self.synthesis_accum[i]);
+        }
+
+        // Shift accumulator left by hop_size, clear the tail
+        self.synthesis_accum.copy_within(self.hop_size.., 0);
+        let tail_start = self.fft_size - self.hop_size;
+        self.synthesis_accum[tail_start..].fill(0.0);
     }
 
-    pub fn hop_size(&self) -> usize {
-        self.hop_size
+    /// Return all currently available output samples.
+    pub fn drain_output(&mut self) -> Vec<f32> {
+        self.output_ready.drain(..).collect()
     }
 
-    pub fn freq_bins(&self) -> usize {
-        self.fft_size / 2 + 1
+    pub fn output_available(&self) -> usize {
+        self.output_ready.len()
     }
 }
 
-/// Generate a Hann window of the given length.
 fn hann_window(len: usize) -> Vec<f32> {
     (0..len)
-        .map(|i| {
-            let phase = 2.0 * PI * i as f32 / len as f32;
-            0.5 * (1.0 - phase.cos())
-        })
+        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / len as f32).cos()))
         .collect()
 }
 
-/// Compute the COLA normalization factor: sum of squared window values at each hop position.
-fn cola_normalization(window: &[f32], hop_size: usize) -> f32 {
-    let fft_size = window.len();
-    let num_overlaps = (fft_size + hop_size - 1) / hop_size;
-    // Compute the sum of squared window values that overlap at a single output sample (center)
+/// Compute the per-sample normalization factor for overlap-add.
+///
+/// For analysis window `w` and synthesis window `w` with hop `H`:
+///   norm = 1 / (fft_size * Σ w[i]²)  summed at the center sample over all overlapping frames.
+fn cola_norm(window: &[f32], hop_size: usize, fft_size: usize) -> f32 {
     let center = fft_size / 2;
+    let num_overlaps = (fft_size + hop_size - 1) / hop_size;
     let mut sum = 0.0f32;
     for k in 0..num_overlaps {
         let start = k * hop_size;
@@ -140,5 +168,9 @@ fn cola_normalization(window: &[f32], hop_size: usize) -> f32 {
             sum += window[idx] * window[idx];
         }
     }
-    sum
+    if sum > 1e-10 {
+        1.0 / (fft_size as f32 * sum)
+    } else {
+        1.0 / fft_size as f32
+    }
 }

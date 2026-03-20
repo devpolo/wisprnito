@@ -1,118 +1,80 @@
 use num_complex::Complex;
 use std::f32::consts::PI;
 
-/// Phase vocoder for time-stretching audio in the frequency domain.
+/// Phase vocoder — processes one STFT frame at a time, maintaining phase
+/// accumulator state across calls so block boundaries don't cause clicks.
 pub struct PhaseVocoder {
-    hop_size: usize,
     freq_bins: usize,
-    /// Phase accumulator per bin for synthesis
-    phase_accum: Vec<f32>,
-    /// Previous analysis frame phases
-    prev_phase: Vec<f32>,
-    /// Expected phase advance per bin per hop
+    /// Expected phase advance per bin per analysis hop: 2π·k·H/N
     omega: Vec<f32>,
+    /// Per-bin phase accumulator for synthesis output
+    phase_accum: Vec<f32>,
+    /// Phase of the previous analysis frame
+    prev_phase: Vec<f32>,
+    initialized: bool,
 }
 
 impl PhaseVocoder {
     pub fn new(fft_size: usize, hop_size: usize) -> Self {
         let freq_bins = fft_size / 2 + 1;
-
-        // Expected phase advance per bin = 2*pi*bin*hop_size/fft_size
         let omega: Vec<f32> = (0..freq_bins)
             .map(|k| 2.0 * PI * k as f32 * hop_size as f32 / fft_size as f32)
             .collect();
 
         Self {
-            hop_size,
             freq_bins,
-            phase_accum: vec![0.0; freq_bins],
-            prev_phase: vec![0.0; freq_bins],
             omega,
+            phase_accum: vec![0.0f32; freq_bins],
+            prev_phase: vec![0.0f32; freq_bins],
+            initialized: false,
         }
     }
 
-    /// Time-stretch STFT frames by factor `alpha`.
+    /// Process a single STFT frame, returning the phase-corrected synthesis frame.
     ///
-    /// alpha > 1 stretches (slower), alpha < 1 compresses (faster).
-    /// The output will have approximately `ceil(frames.len() * alpha)` frames.
-    pub fn process(
-        &mut self,
-        frames: &[Vec<Complex<f32>>],
-        alpha: f32,
-    ) -> Vec<Vec<Complex<f32>>> {
-        if frames.is_empty() {
-            return Vec::new();
-        }
+    /// The synthesis hop equals the analysis hop (no time stretch). Pitch shift is
+    /// achieved by resampling the ISTFT output. The vocoder's job here is solely to
+    /// maintain per-bin phase coherence across hops, which prevents phasiness artifacts.
+    pub fn process_frame(&mut self, frame: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        let mut out = vec![Complex::new(0.0f32, 0.0f32); self.freq_bins];
 
-        let num_input = frames.len();
-        let num_output = ((num_input as f32) * alpha).ceil() as usize;
-        let mut output_frames = Vec::with_capacity(num_output);
-
-        // Reset accumulators
-        self.phase_accum.fill(0.0);
-        self.prev_phase.fill(0.0);
-
-        // Initialize phase accumulator from first frame
-        for k in 0..self.freq_bins {
-            self.phase_accum[k] = frames[0][k].arg();
-            self.prev_phase[k] = frames[0][k].arg();
-        }
-
-        // First output frame uses first input frame magnitudes with accumulated phase
-        let mut out_frame = vec![Complex::new(0.0, 0.0); self.freq_bins];
-        for k in 0..self.freq_bins {
-            let mag = frames[0][k].norm();
-            out_frame[k] = Complex::from_polar(mag, self.phase_accum[k]);
-        }
-        output_frames.push(out_frame);
-
-        // Generate remaining output frames by interpolating input position
-        for out_idx in 1..num_output {
-            // Map output frame index back to (fractional) input frame index
-            let in_pos = out_idx as f32 / alpha;
-            let in_idx = in_pos.floor() as usize;
-            let frac = in_pos - in_idx as f32;
-
-            // Clamp to valid range
-            let idx0 = in_idx.min(num_input - 1);
-            let idx1 = (in_idx + 1).min(num_input - 1);
-
-            let mut out_frame = vec![Complex::new(0.0, 0.0); self.freq_bins];
-
+        if !self.initialized {
+            // Seed accumulators from the first frame's phases
             for k in 0..self.freq_bins {
-                // Interpolate magnitude
-                let mag0 = frames[idx0][k].norm();
-                let mag1 = frames[idx1][k].norm();
-                let mag = mag0 + frac * (mag1 - mag0);
-
-                // Compute instantaneous frequency from the analysis frame pair
-                let phase0 = frames[idx0][k].arg();
-                let phase1 = frames[idx1][k].arg();
-
-                // Phase difference and unwrap
-                let dp = phase1 - phase0;
-                let expected = self.omega[k];
-                let deviation = dp - expected;
-                // Wrap deviation to [-pi, pi]
-                let wrapped = deviation - (2.0 * PI) * ((deviation + PI) / (2.0 * PI)).floor();
-                let inst_freq = expected + wrapped;
-
-                // Advance phase accumulator by the synthesis hop
-                // (synthesis hop = analysis hop since we're changing frame count, not hop)
-                self.phase_accum[k] += inst_freq;
-
-                out_frame[k] = Complex::from_polar(mag, self.phase_accum[k]);
+                self.phase_accum[k] = frame[k].arg();
+                self.prev_phase[k] = frame[k].arg();
             }
-
-            output_frames.push(out_frame);
+            self.initialized = true;
+            for k in 0..self.freq_bins {
+                out[k] = Complex::from_polar(frame[k].norm(), self.phase_accum[k]);
+            }
+            return out;
         }
 
-        output_frames
+        for k in 0..self.freq_bins {
+            let mag = frame[k].norm();
+            let phase = frame[k].arg();
+
+            // Deviation from the expected phase advance
+            let dp = phase - self.prev_phase[k];
+            let deviation = dp - self.omega[k];
+            // Wrap deviation to [-π, π]
+            let wrapped = deviation - (2.0 * PI) * ((deviation + PI) / (2.0 * PI)).floor();
+            let inst_freq = self.omega[k] + wrapped;
+
+            // Advance synthesis accumulator by the analysis hop (synthesis hop == analysis hop)
+            self.phase_accum[k] += inst_freq;
+            self.prev_phase[k] = phase;
+
+            out[k] = Complex::from_polar(mag, self.phase_accum[k]);
+        }
+
+        out
     }
 
-    /// Reset internal state (phase accumulators).
     pub fn reset(&mut self) {
         self.phase_accum.fill(0.0);
         self.prev_phase.fill(0.0);
+        self.initialized = false;
     }
 }
