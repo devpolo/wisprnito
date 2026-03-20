@@ -37,6 +37,8 @@ enum Commands {
     Devices,
     /// Show current configuration
     Config,
+    /// Remove LaunchAgent and stop the daemon
+    Uninstall,
     /// Run in foreground (used internally by `start`)
     #[command(hide = true)]
     Foreground {
@@ -94,6 +96,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Status => cmd_status(),
         Commands::Devices => cmd_devices(),
         Commands::Config => cmd_config(),
+        Commands::Uninstall => cmd_uninstall(),
         Commands::Foreground { input, output, low_latency, pitch, formant, jitter, passthrough } => {
             cmd_foreground(input, output, low_latency, pitch, formant, jitter, passthrough)
         }
@@ -378,6 +381,27 @@ fn cmd_config() -> anyhow::Result<()> {
     let path = config::Config::path();
     println!("Config file: {}", path.display());
     println!("{}", serde_json::to_string_pretty(&cfg)?);
+    Ok(())
+}
+
+fn cmd_uninstall() -> anyhow::Result<()> {
+    // Stop daemon if running
+    cmd_stop().ok();
+    // Unload and remove LaunchAgent plist
+    let plist = {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join("Library/LaunchAgents/com.devpolo.wisprnito.plist")
+    };
+    if plist.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", plist.to_str().unwrap()])
+            .status();
+        std::fs::remove_file(&plist)?;
+        println!("LaunchAgent removed.");
+    }
+    // Remove data dir
+    let _ = std::fs::remove_dir_all(pid_file_path().parent().unwrap());
+    println!("Uninstalled. Remove the binary with: sudo rm /usr/local/bin/wisprnito");
     Ok(())
 }
 

@@ -2,6 +2,11 @@
 name = "wisprnito"
 version = "0.1.0"
 edition = "2021"
+description = "Real-time voice anonymizer to defeat voice fingerprinting by STT models"
+repository = "https://github.com/devpolo/wisprnito"
+license = "MIT"
+keywords = ["audio", "privacy", "voice", "anonymizer", "microphone"]
+categories = ["multimedia::audio", "command-line-utilities"]
 
 [[bin]]
 name = "wisprnito"

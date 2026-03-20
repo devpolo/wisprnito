@@ -1,5 +1,20 @@
 # Wisprnito
 
+> Real-time voice anonymizer — transforms your mic input so STT models can't fingerprint your voice.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/devpolo/wisprnito/main/install.sh | bash
+```
+
+Then:
+1. `wisprnito start`
+2. System Settings → Sound → Input → select **BlackHole 2ch**
+3. Done — all apps now receive your anonymized voice
+
+---
+
 Real-time voice anonymizer. Intercepts your microphone, transforms pitch, formants, and phase to defeat voice fingerprinting, then exposes the result as a virtual microphone (BlackHole 2ch on macOS).
 
 Speech stays intelligible. Your voice becomes unrecognizable to speaker-ID models.

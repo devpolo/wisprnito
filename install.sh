@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="wisprnito/wisprnito"
+REPO="devpolo/wisprnito"
 WISPRNITO_VERSION="${WISPRNITO_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 
@@ -72,12 +72,27 @@ install_macos() {
     info "Installing to ${INSTALL_DIR}/wisprnito..."
     sudo install -m 755 "${tmpdir}/wisprnito" "${INSTALL_DIR}/wisprnito"
 
-    # Optionally install LaunchAgent
-    read -rp "Install LaunchAgent for auto-start? [y/N] " answer
-    if [[ "${answer,,}" == "y" ]]; then
-        wisprnito start --help >/dev/null 2>&1 || true
-        info "You can configure a LaunchAgent by running: wisprnito start"
-    fi
+    install_launchagent
+
+    info "Done! Start now: wisprnito start"
+    info "Then set BlackHole 2ch as mic in System Settings → Sound → Input"
+    info "To uninstall: wisprnito uninstall"
+}
+
+install_launchagent() {
+    local plist=~/Library/LaunchAgents/com.devpolo.wisprnito.plist
+    cat > "$plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.devpolo.wisprnito</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/local/bin/wisprnito</string><string>start</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+PLIST
+    launchctl load "$plist" 2>/dev/null || true
+    info "LaunchAgent installed — wisprnito will auto-start on login."
 }
 
 install_linux() {
